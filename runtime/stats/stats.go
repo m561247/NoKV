@@ -1,4 +1,9 @@
-package NoKV
+// Package stats owns periodic runtime metric collection and snapshot
+// publication for a NoKV.DB. The Stats type runs a small ticker that
+// builds a StatsSnapshot from its Host and republishes it through expvar
+// under "NoKV.Stats". The root NoKV package provides Stats with a Host
+// implementation; tests construct mock Hosts directly.
+package stats
 
 import (
 	"expvar"
@@ -9,6 +14,7 @@ import (
 	"time"
 
 	"github.com/feichai0017/NoKV/engine/kv"
+	"github.com/feichai0017/NoKV/engine/lsm"
 	"github.com/feichai0017/NoKV/engine/wal"
 	"github.com/feichai0017/NoKV/metrics"
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
@@ -17,9 +23,57 @@ import (
 	"github.com/feichai0017/NoKV/utils"
 )
 
+// LSMSource is the narrow LSM surface stats reads from. Implemented by
+// engine/lsm.LSM.
+type LSMSource interface {
+	Diagnostics() lsm.Diagnostics
+	ThrottlePressurePermille() uint32
+	ThrottleRateBytesPerSec() uint64
+}
+
+// VlogSource is the narrow value-log surface stats reads from.
+// Implemented by engine/vlog.Consumer.
+type VlogSource interface {
+	Metrics() metrics.ValueLogMetrics
+}
+
+// Host wires the Stats subsystem back into its DB host. Every accessor
+// is read-only; Stats never mutates host state.
+type Host interface {
+	// Storage subsystems.
+	LSM() LSMSource
+	Vlog() VlogSource
+	LSMWALs() []*wal.Manager
+	// RaftWALsLocked invokes fn while holding the host's raft-WAL mutex.
+	// Stats only iterates the slice while the lock is held.
+	RaftWALsLocked(fn func(wals []*wal.Manager))
+	BackgroundWatchdogs() []*wal.Watchdog
+	HotWrite() *thermos.RotatingThermos
+	IteratorReused() uint64
+	WriteMetrics() *metrics.WriteMetrics
+
+	// Atomic indicators of write throttling state.
+	BlockWritesActive() bool
+	SlowWritesActive() bool
+	HotWriteLimited() uint64
+
+	// ValueLogDisabledOrphans returns the number of value-log segments
+	// the manifest still references when EnableValueLog=false. Zero
+	// when vlog is enabled, or when there is nothing to migrate. The
+	// stats subsystem surfaces this only when Vlog() returns nil.
+	ValueLogDisabledOrphans() int
+
+	// Options-snapshot accessors.
+	RaftLagWarnSegments() int64
+	WALTypedRecordWarnRatio() float64
+	WALTypedRecordWarnSegments() int64
+	ThermosTopK() int
+	RaftPointerSnapshot() func() map[uint64]localmeta.RaftLogPointer
+}
+
 // Stats owns periodic runtime metric collection and snapshot publication.
 type Stats struct {
-	db       *DB
+	host     Host
 	closer   *utils.Closer
 	once     sync.Once
 	interval time.Duration
@@ -40,42 +94,42 @@ type HotKeyStat struct {
 
 // LSMLevelStats captures aggregated metrics per LSM level.
 type LSMLevelStats struct {
-	Level              int     `json:"level"`
-	TableCount         int     `json:"tables"`
-	SizeBytes          int64   `json:"size_bytes"`
-	ValueBytes         int64   `json:"value_bytes"`
-	StaleBytes         int64   `json:"stale_bytes"`
-	IngestTables       int     `json:"ingest_tables"`
-	IngestSizeBytes    int64   `json:"ingest_size_bytes"`
-	IngestValueBytes   int64   `json:"ingest_value_bytes"`
-	ValueDensity       float64 `json:"value_density"`
-	IngestValueDensity float64 `json:"ingest_value_density"`
-	IngestRuns         int64   `json:"ingest_runs"`
-	IngestMs           float64 `json:"ingest_ms"`
-	IngestTablesCount  int64   `json:"ingest_tables_compacted"`
-	MergeRuns          int64   `json:"ingest_merge_runs"`
-	MergeMs            float64 `json:"ingest_merge_ms"`
-	MergeTables        int64   `json:"ingest_merge_tables"`
+	Level                       int     `json:"level"`
+	TableCount                  int     `json:"tables"`
+	SizeBytes                   int64   `json:"size_bytes"`
+	ValueBytes                  int64   `json:"value_bytes"`
+	StaleBytes                  int64   `json:"stale_bytes"`
+	StagingTables               int     `json:"staging_tables"`
+	StagingSizeBytes            int64   `json:"staging_size_bytes"`
+	StagingValueBytes           int64   `json:"staging_value_bytes"`
+	ValueDensity                float64 `json:"value_density"`
+	StagingValueDensity         float64 `json:"staging_value_density"`
+	StagingRuns                 int64   `json:"staging_runs"`
+	StagingMs                   float64 `json:"staging_ms"`
+	StagingTablesCompactedCount int64   `json:"staging_tables_compacted"`
+	MergeRuns                   int64   `json:"staging_merge_runs"`
+	MergeMs                     float64 `json:"staging_merge_ms"`
+	MergeTables                 int64   `json:"staging_merge_tables"`
 }
 
 func levelMetricsToStats(lvl metrics.LevelMetrics) LSMLevelStats {
 	return LSMLevelStats{
-		Level:              lvl.Level,
-		TableCount:         lvl.TableCount,
-		SizeBytes:          lvl.SizeBytes,
-		ValueBytes:         lvl.ValueBytes,
-		StaleBytes:         lvl.StaleBytes,
-		IngestTables:       lvl.IngestTableCount,
-		IngestSizeBytes:    lvl.IngestSizeBytes,
-		IngestValueBytes:   lvl.IngestValueBytes,
-		ValueDensity:       lvl.ValueDensity,
-		IngestValueDensity: lvl.IngestValueDensity,
-		IngestRuns:         lvl.IngestRuns,
-		IngestMs:           lvl.IngestMs,
-		IngestTablesCount:  lvl.IngestTablesCompacted,
-		MergeRuns:          lvl.IngestMergeRuns,
-		MergeMs:            lvl.IngestMergeMs,
-		MergeTables:        lvl.IngestMergeTables,
+		Level:                       lvl.Level,
+		TableCount:                  lvl.TableCount,
+		SizeBytes:                   lvl.SizeBytes,
+		ValueBytes:                  lvl.ValueBytes,
+		StaleBytes:                  lvl.StaleBytes,
+		StagingTables:               lvl.StagingTableCount,
+		StagingSizeBytes:            lvl.StagingSizeBytes,
+		StagingValueBytes:           lvl.StagingValueBytes,
+		ValueDensity:                lvl.ValueDensity,
+		StagingValueDensity:         lvl.StagingValueDensity,
+		StagingRuns:                 lvl.StagingRuns,
+		StagingMs:                   lvl.StagingMs,
+		StagingTablesCompactedCount: lvl.StagingTablesCompacted,
+		MergeRuns:                   lvl.StagingMergeRuns,
+		MergeMs:                     lvl.StagingMergeMs,
+		MergeTables:                 lvl.StagingMergeTables,
 	}
 }
 
@@ -113,19 +167,19 @@ type FlushStatsSnapshot struct {
 	Completed     int64   `json:"completed"`
 }
 
-// CompactionStatsSnapshot summarizes compaction backlog, runtime, and ingest behavior.
+// CompactionStatsSnapshot summarizes compaction backlog, runtime, and staging behavior.
 type CompactionStatsSnapshot struct {
 	Backlog              int64   `json:"backlog"`
 	MaxScore             float64 `json:"max_score"`
 	LastDurationMs       float64 `json:"last_duration_ms"`
 	MaxDurationMs        float64 `json:"max_duration_ms"`
 	Runs                 uint64  `json:"runs"`
-	IngestRuns           int64   `json:"ingest_runs"`
-	MergeRuns            int64   `json:"ingest_merge_runs"`
-	IngestMs             float64 `json:"ingest_ms"`
-	MergeMs              float64 `json:"ingest_merge_ms"`
-	IngestTables         int64   `json:"ingest_tables"`
-	MergeTables          int64   `json:"ingest_merge_tables"`
+	StagingRuns          int64   `json:"staging_runs"`
+	MergeRuns            int64   `json:"staging_merge_runs"`
+	StagingMs            float64 `json:"staging_ms"`
+	MergeMs              float64 `json:"staging_merge_ms"`
+	StagingTables        int64   `json:"staging_tables"`
+	MergeTables          int64   `json:"staging_merge_tables"`
 	ValueWeight          float64 `json:"value_weight"`
 	ValueWeightSuggested float64 `json:"value_weight_suggested,omitempty"`
 }
@@ -137,6 +191,11 @@ type ValueLogStatsSnapshot struct {
 	DiscardQueue   int                        `json:"discard_queue"`
 	Heads          map[uint32]kv.ValuePtr     `json:"heads,omitempty"`
 	GC             metrics.ValueLogGCSnapshot `json:"gc"`
+	// DisabledOrphans is non-zero when EnableValueLog=false but the
+	// manifest still references that many value-log segments — every
+	// Get/iterator hit on a value pointer will fail until the operator
+	// either re-enables EnableValueLog or migrates values out of vlog.
+	DisabledOrphans int `json:"disabled_orphans,omitempty"`
 }
 
 // WALStatsSnapshot captures WAL head position, record mix, and watchdog status.
@@ -231,11 +290,15 @@ type RangeFilterStatsSnapshot struct {
 	Fallbacks         uint64 `json:"fallbacks"`
 }
 
-func newStats(db *DB) *Stats {
+// New constructs a Stats wired to host. interval defaults to 5s when 0.
+func New(host Host, interval time.Duration) *Stats {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
 	s := &Stats{
-		db:       db,
+		host:     host,
 		closer:   utils.NewCloser(),
-		interval: 5 * time.Second,
+		interval: interval,
 	}
 	statsExpvarOnce.Do(func() {
 		expvar.Publish("NoKV.Stats", expvar.Func(func() any {
@@ -261,7 +324,11 @@ func (s *Stats) StartStats() {
 
 // Close stops the stats loop.
 func (s *Stats) Close() error {
-	return s.close()
+	if s == nil {
+		return nil
+	}
+	s.closer.Close()
+	return nil
 }
 
 // SetRegionMetrics attaches region metrics recorder used in snapshots.
@@ -279,20 +346,20 @@ func (s *Stats) run() {
 	defer ticker.Stop()
 
 	// Collect once at startup so expvar has values immediately.
-	s.collect()
+	s.Collect()
 
 	for {
 		select {
 		case <-ticker.C:
-			s.collect()
+			s.Collect()
 		case <-s.closer.Closed():
 			return
 		}
 	}
 }
 
-// collect snapshots background queues and propagates them to expvar.
-func (s *Stats) collect() {
+// Collect snapshots background queues and propagates them to expvar.
+func (s *Stats) Collect() {
 	if s == nil {
 		return
 	}
@@ -303,19 +370,17 @@ func (s *Stats) collect() {
 // Snapshot returns a point-in-time metrics snapshot without mutating state.
 func (s *Stats) Snapshot() StatsSnapshot {
 	var snap StatsSnapshot
-	if s == nil || s.db == nil {
+	if s == nil || s.host == nil {
 		return snap
 	}
 
-	if s.db.opt != nil {
-		if thresh := s.db.opt.RaftLagWarnSegments; thresh > 0 {
-			snap.Raft.LagWarnThreshold = thresh
-		}
+	if thresh := s.host.RaftLagWarnSegments(); thresh > 0 {
+		snap.Raft.LagWarnThreshold = thresh
 	}
 
 	// Flush backlog and LSM diagnostics.
-	if s.db.lsm != nil {
-		diag := s.db.lsm.Diagnostics()
+	if lsmSrc := s.host.LSM(); lsmSrc != nil {
+		diag := lsmSrc.Diagnostics()
 		snap.Compaction.ValueWeight = diag.Compaction.ValueWeight
 		alertThreshold := diag.Compaction.AlertThreshold
 		fstats := diag.Flush
@@ -355,31 +420,31 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		if levels := diag.Levels; len(levels) > 0 {
 			snap.LSM.Levels = make([]LSMLevelStats, 0, len(levels))
 			var maxDensity float64
-			var ingestRuns, ingestMergeRuns int64
-			var ingestMs, ingestMergeMs float64
-			var ingestTables, ingestMergeTables int64
+			var stagingRuns, stagingMergeRuns int64
+			var stagingMs, stagingMergeMs float64
+			var stagingTables, stagingMergeTables int64
 			for _, lvl := range levels {
 				statsLvl := levelMetricsToStats(lvl)
 				snap.LSM.Levels = append(snap.LSM.Levels, statsLvl)
 				if statsLvl.ValueDensity > maxDensity {
 					maxDensity = statsLvl.ValueDensity
 				}
-				if statsLvl.IngestValueDensity > maxDensity {
-					maxDensity = statsLvl.IngestValueDensity
+				if statsLvl.StagingValueDensity > maxDensity {
+					maxDensity = statsLvl.StagingValueDensity
 				}
-				ingestRuns += statsLvl.IngestRuns
-				ingestMergeRuns += statsLvl.MergeRuns
-				ingestMs += statsLvl.IngestMs
-				ingestMergeMs += statsLvl.MergeMs
-				ingestTables += statsLvl.IngestTablesCount
-				ingestMergeTables += statsLvl.MergeTables
+				stagingRuns += statsLvl.StagingRuns
+				stagingMergeRuns += statsLvl.MergeRuns
+				stagingMs += statsLvl.StagingMs
+				stagingMergeMs += statsLvl.MergeMs
+				stagingTables += statsLvl.StagingTablesCompactedCount
+				stagingMergeTables += statsLvl.MergeTables
 			}
-			snap.Compaction.IngestRuns = ingestRuns
-			snap.Compaction.MergeRuns = ingestMergeRuns
-			snap.Compaction.IngestMs = ingestMs
-			snap.Compaction.MergeMs = ingestMergeMs
-			snap.Compaction.IngestTables = ingestTables
-			snap.Compaction.MergeTables = ingestMergeTables
+			snap.Compaction.StagingRuns = stagingRuns
+			snap.Compaction.MergeRuns = stagingMergeRuns
+			snap.Compaction.StagingMs = stagingMs
+			snap.Compaction.MergeMs = stagingMergeMs
+			snap.Compaction.StagingTables = stagingTables
+			snap.Compaction.MergeTables = stagingMergeTables
 			snap.LSM.ValueDensityMax = maxDensity
 			if alertThreshold > 0 && maxDensity >= alertThreshold {
 				snap.LSM.ValueDensityAlert = true
@@ -397,7 +462,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		if len(snap.LSM.Levels) > 0 {
 			var totalValue int64
 			for _, lvl := range snap.LSM.Levels {
-				totalValue += lvl.ValueBytes + lvl.IngestValueBytes
+				totalValue += lvl.ValueBytes + lvl.StagingValueBytes
 			}
 			snap.LSM.ValueBytesTotal = totalValue
 		}
@@ -422,10 +487,12 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		if total := cm.IndexHits + cm.IndexMisses; total > 0 {
 			snap.Cache.IndexHitRate = float64(cm.IndexHits) / float64(total)
 		}
+		snap.Write.ThrottlePressure = lsmSrc.ThrottlePressurePermille()
+		snap.Write.ThrottleRate = lsmSrc.ThrottleRateBytesPerSec()
 	}
 
-	if s.db.writeMetrics != nil {
-		wsnap := s.db.writeMetrics.Snapshot()
+	if wm := s.host.WriteMetrics(); wm != nil {
+		wsnap := wm.Snapshot()
 		snap.Write.QueueDepth = wsnap.QueueLen
 		snap.Write.QueueEntries = wsnap.QueueEntries
 		snap.Write.QueueBytes = wsnap.QueueBytes
@@ -439,8 +506,8 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		snap.Write.SyncCount = wsnap.SyncSamples
 		snap.Write.BatchesTotal = wsnap.Batches
 	}
-	stopActive := s.db.blockWrites.Load() == 1
-	slowActive := s.db.slowWrites.Load() == 1
+	stopActive := s.host.BlockWritesActive()
+	slowActive := s.host.SlowWritesActive()
 	snap.Write.ThrottleActive = stopActive || slowActive
 	snap.Write.SlowdownActive = slowActive
 	switch {
@@ -451,16 +518,12 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	default:
 		snap.Write.ThrottleMode = "none"
 	}
-	if s.db.lsm != nil {
-		snap.Write.ThrottlePressure = s.db.lsm.ThrottlePressurePermille()
-		snap.Write.ThrottleRate = s.db.lsm.ThrottleRateBytesPerSec()
-	}
 	if stopActive && snap.Write.ThrottlePressure == 0 {
 		snap.Write.ThrottlePressure = 1000
 	} else if slowActive && snap.Write.ThrottlePressure == 0 {
 		snap.Write.ThrottlePressure = 1
 	}
-	snap.Write.HotKeyLimited = s.db.hotWriteLimited.Load()
+	snap.Write.HotKeyLimited = s.host.HotWriteLimited()
 
 	if rm := s.regionMetrics.Load(); rm != nil {
 		rms := rm.Snapshot()
@@ -485,7 +548,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	// across shards).
 	var aggregated wal.Metrics
 	var anyShardStats bool
-	for _, mgr := range s.db.lsmWALs {
+	for _, mgr := range s.host.LSMWALs() {
 		if mgr == nil {
 			continue
 		}
@@ -519,8 +582,8 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		snap.WAL.SegmentCount = int64(aggregated.SegmentCount)
 		snap.WAL.SegmentsRemoved = aggregated.RemovedSegments
 	}
-	if s.db.opt != nil && s.db.opt.RaftPointerSnapshot != nil {
-		ptrs = s.db.opt.RaftPointerSnapshot()
+	if ptrFn := s.host.RaftPointerSnapshot(); ptrFn != nil {
+		ptrs = ptrFn()
 		snap.Raft.GroupCount = len(ptrs)
 	}
 
@@ -533,31 +596,31 @@ func (s *Stats) Snapshot() StatsSnapshot {
 			removableRaftSegments++
 		}
 	}
-	s.db.raftWALMu.Lock()
-	for _, mgr := range s.db.raftWALs {
-		if mgr == nil {
-			continue
-		}
-		shardStats := mgr.Metrics()
-		shardSegments := mgr.SegmentMetrics()
-		shardAnalysis := metrics.AnalyzeWALBacklog(shardStats, shardSegments)
-		snap.WAL.RecordCounts.Entries += shardAnalysis.RecordCounts.Entries
-		snap.WAL.RecordCounts.RaftEntries += shardAnalysis.RecordCounts.RaftEntries
-		snap.WAL.RecordCounts.RaftStates += shardAnalysis.RecordCounts.RaftStates
-		snap.WAL.RecordCounts.RaftSnapshots += shardAnalysis.RecordCounts.RaftSnapshots
-		snap.WAL.RecordCounts.Other += shardAnalysis.RecordCounts.Other
-		snap.WAL.SegmentsWithRaftRecords += shardAnalysis.SegmentsWithRaft
-		if shardStats != nil {
-			snap.WAL.SegmentCount += int64(shardStats.SegmentCount)
-			snap.WAL.SegmentsRemoved += shardStats.RemovedSegments
-		}
-		for _, id := range shardAnalysis.RemovableSegments {
-			if shardSegments[id].RaftRecords() > 0 && shardStats != nil && id < shardStats.ActiveSegment {
-				removableRaftSegments++
+	s.host.RaftWALsLocked(func(wals []*wal.Manager) {
+		for _, mgr := range wals {
+			if mgr == nil {
+				continue
+			}
+			shardStats := mgr.Metrics()
+			shardSegments := mgr.SegmentMetrics()
+			shardAnalysis := metrics.AnalyzeWALBacklog(shardStats, shardSegments)
+			snap.WAL.RecordCounts.Entries += shardAnalysis.RecordCounts.Entries
+			snap.WAL.RecordCounts.RaftEntries += shardAnalysis.RecordCounts.RaftEntries
+			snap.WAL.RecordCounts.RaftStates += shardAnalysis.RecordCounts.RaftStates
+			snap.WAL.RecordCounts.RaftSnapshots += shardAnalysis.RecordCounts.RaftSnapshots
+			snap.WAL.RecordCounts.Other += shardAnalysis.RecordCounts.Other
+			snap.WAL.SegmentsWithRaftRecords += shardAnalysis.SegmentsWithRaft
+			if shardStats != nil {
+				snap.WAL.SegmentCount += int64(shardStats.SegmentCount)
+				snap.WAL.SegmentsRemoved += shardStats.RemovedSegments
+			}
+			for _, id := range shardAnalysis.RemovableSegments {
+				if shardSegments[id].RaftRecords() > 0 && shardStats != nil && id < shardStats.ActiveSegment {
+					removableRaftSegments++
+				}
 			}
 		}
-	}
-	s.db.raftWALMu.Unlock()
+	})
 	snap.WAL.RemovableRaftSegments = removableRaftSegments
 	if total := snap.WAL.RecordCounts.Total(); total > 0 {
 		raftRecords := snap.WAL.RecordCounts.RaftRecords()
@@ -602,14 +665,14 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		snap.Raft.MaxLagSegments = maxLag
 		snap.Raft.LaggingGroups = lagging
 	}
-	threshold := max(s.db.opt.RaftLagWarnSegments, 0)
+	threshold := max(s.host.RaftLagWarnSegments(), 0)
 	snap.Raft.LagWarnThreshold = threshold
 	if threshold > 0 && snap.Raft.MaxLagSegments >= threshold && snap.Raft.LaggingGroups > 0 {
 		snap.Raft.LagWarning = true
 	}
 
-	warning, reason := metrics.WALTypedWarning(snap.WAL.TypedRecordRatio, snap.WAL.SegmentsWithRaftRecords, s.db.opt.WALTypedRecordWarnRatio, s.db.opt.WALTypedRecordWarnSegments)
-	watchdogs := s.db.background.WALWatchdogs()
+	warning, reason := metrics.WALTypedWarning(snap.WAL.TypedRecordRatio, snap.WAL.SegmentsWithRaftRecords, s.host.WALTypedRecordWarnRatio(), s.host.WALTypedRecordWarnSegments())
+	watchdogs := s.host.BackgroundWatchdogs()
 	if len(watchdogs) > 0 {
 		var anyWarn bool
 		var warnReason string
@@ -641,33 +704,30 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	}
 
 	// Value log backlog.
-	if s.db.vlog != nil {
-		stats := s.db.vlog.metrics()
+	if vlogSrc := s.host.Vlog(); vlogSrc != nil {
+		stats := vlogSrc.Metrics()
 		snap.ValueLog.Segments = stats.Segments
 		snap.ValueLog.PendingDeletes = stats.PendingDeletes
 		snap.ValueLog.DiscardQueue = stats.DiscardQueue
 		snap.ValueLog.Heads = stats.Heads
+	} else {
+		// EnableValueLog=false. If the manifest still references
+		// value-log segments, surface the orphan count so operators
+		// see the mismatch in stats output without waiting for a
+		// failing read to surface it.
+		snap.ValueLog.DisabledOrphans = s.host.ValueLogDisabledOrphans()
 	}
-	if s.db != nil && s.db.hotWrite != nil {
-		for _, item := range s.db.hotWrite.TopN(s.db.opt.ThermosTopK) {
+	if hot := s.host.HotWrite(); hot != nil {
+		topK := s.host.ThermosTopK()
+		for _, item := range hot.TopN(topK) {
 			snap.Hot.WriteKeys = append(snap.Hot.WriteKeys, HotKeyStat{Key: item.Key, Count: item.Count})
 		}
-		hotStats := s.db.hotWrite.Stats()
+		hotStats := hot.Stats()
 		snap.Hot.WriteRing = &hotStats
 	}
-	if s.db != nil && s.db.iterPool != nil {
-		snap.Cache.IteratorReused = s.db.iterPool.Reused()
-	}
+	snap.Cache.IteratorReused = s.host.IteratorReused()
 	snap.ValueLog.GC = metrics.DefaultValueLogGCCollector().Snapshot()
 	snap.Transport = transportpkg.GRPCMetricsSnapshot()
 	snap.Redis = metrics.DefaultRedisSnapshot()
 	return snap
-}
-
-func (s *Stats) close() error {
-	if s == nil {
-		return nil
-	}
-	s.closer.Close()
-	return nil
 }

@@ -1,4 +1,10 @@
-package NoKV
+// Package iterator implements the user-facing DB iterator state machine
+// on top of an LSM merge iterator + value-log resolver. The root NoKV
+// package keeps the (db *DB) NewIterator / NewInternalIterator wrappers
+// as thin facades around iterator.New / iterator.NewInternal so callers
+// continue to write `db.NewIterator(...)` while all of the actual
+// state-machine code lives here, decoupled from *DB.
+package iterator
 
 import (
 	"bytes"
@@ -6,17 +12,40 @@ import (
 	"github.com/feichai0017/NoKV/engine/index"
 	"github.com/feichai0017/NoKV/engine/kv"
 	"github.com/feichai0017/NoKV/engine/lsm"
-	dbruntime "github.com/feichai0017/NoKV/internal/runtime"
 	"github.com/feichai0017/NoKV/utils"
 	"github.com/pkg/errors"
 )
 
+// Storage is the narrow LSM surface the user-facing iterator needs:
+// build the merged per-shard sub-iterators, query for any active range
+// tombstone, and pin a snapshot view if there is one. Implemented by
+// engine/lsm.LSM.
+type Storage interface {
+	NewIterators(opt *index.Options) []index.Iterator
+	HasAnyRangeTombstone() bool
+	PinRangeTombstoneView() *lsm.RangeTombstoneView
+}
+
+// Vlog resolves a value pointer into its concrete bytes; only the Read
+// method is needed here. Implemented by engine/vlog.Consumer.
+type Vlog interface {
+	Read(*kv.ValuePtr) ([]byte, func(), error)
+}
+
+// Deps wires the iterator into its host. Storage + Vlog + Pool are the
+// only DB-side touch points the iterator needs to function.
+type Deps struct {
+	Storage Storage
+	Vlog    Vlog
+	Pool    *IteratorPool
+}
+
 // DBIterator wraps the merged LSM iterators and optionally resolves value-log pointers.
 type DBIterator struct {
 	iitr index.Iterator
-	vlog *valueLog
-	pool *dbruntime.IteratorPool
-	ctx  *dbruntime.IteratorContext
+	vlog Vlog
+	pool *IteratorPool
+	ctx  *IteratorContext
 	rtv  *lsm.RangeTombstoneView
 	// rtCheck indicates whether this iterator snapshot needs tombstone
 	// coverage checks.
@@ -53,7 +82,7 @@ type DBIterator struct {
 // Item is the user-facing iterator item backed by an entry and optional vlog reader.
 type Item struct {
 	e        *kv.Entry
-	vlog     *valueLog
+	vlog     Vlog
 	valueBuf []byte
 }
 
@@ -75,7 +104,7 @@ func (it *Item) ValueCopy(dst []byte) ([]byte, error) {
 		}
 		var vp kv.ValuePtr
 		vp.Decode(val)
-		fetched, cb, err := it.vlog.read(&vp)
+		fetched, cb, err := it.vlog.Read(&vp)
 		if cb != nil {
 			defer cb()
 		}
@@ -95,17 +124,17 @@ func (it *Item) ValueCopy(dst []byte) ([]byte, error) {
 	return dst, nil
 }
 
-// NewIterator creates a DB-level iterator over user keys in the default column family.
-func (db *DB) NewIterator(opt *index.Options) index.Iterator {
+// New creates a user-facing iterator over user keys in the default column family.
+func New(deps Deps, opt *index.Options) index.Iterator {
 	if opt == nil {
 		opt = &index.Options{}
 	}
 	keyOnly := opt.OnlyUseKey
-	ctx := db.iterPool.Get()
-	ctx.Append(db.lsm.NewIterators(opt)...)
+	ctx := deps.Pool.Get()
+	ctx.Append(deps.Storage.NewIterators(opt)...)
 	itr := &DBIterator{
-		vlog:       db.vlog,
-		pool:       db.iterPool,
+		vlog:       deps.Vlog,
+		pool:       deps.Pool,
 		ctx:        ctx,
 		keyOnly:    keyOnly,
 		lowerBound: opt.LowerBound,
@@ -114,25 +143,25 @@ func (db *DB) NewIterator(opt *index.Options) index.Iterator {
 		hasUpper:   len(opt.UpperBound) > 0,
 		isAsc:      opt.IsAsc,
 	}
-	itr.item.vlog = db.vlog
+	itr.item.vlog = deps.Vlog
 	itr.item.e = &itr.entry
 	itr.iitr = lsm.NewMergeIterator(ctx.Iterators(), !opt.IsAsc)
-	if db.lsm != nil {
-		itr.rtCheck = db.lsm.HasAnyRangeTombstone()
+	if deps.Storage != nil {
+		itr.rtCheck = deps.Storage.HasAnyRangeTombstone()
 	}
 	if itr.rtCheck {
-		itr.rtv = db.lsm.PinRangeTombstoneView()
+		itr.rtv = deps.Storage.PinRangeTombstoneView()
 	}
 	return itr
 }
 
-// NewInternalIterator returns an iterator over internal keys (CF marker + user key + timestamp).
+// NewInternal returns an iterator over internal keys (CF marker + user key + timestamp).
 // Callers should decode kv.Entry.Key via kv.SplitInternalKey and handle ok=false.
-func (db *DB) NewInternalIterator(opt *index.Options) index.Iterator {
+func NewInternal(storage Storage, opt *index.Options) index.Iterator {
 	if opt == nil {
 		opt = &index.Options{}
 	}
-	iters := db.lsm.NewIterators(opt)
+	iters := storage.NewIterators(opt)
 	return lsm.NewMergeIterator(iters, !opt.IsAsc)
 }
 
@@ -199,10 +228,10 @@ func (iter *DBIterator) Seek(key []byte) {
 		}
 	}
 
-	// Convert user key to internal key for seeking.
-	// We use MaxUint64 as version to seek to the latest version of the key.
-	// We default to CFDefault as DBIterator currently doesn't support specifying CF.
-	internalKey := kv.InternalKey(kv.CFDefault, key, nonTxnMaxVersion)
+	// Convert user key to internal key for seeking. We use kv.MaxVersion
+	// (the non-transactional read upper-bound sentinel) and CFDefault
+	// because DBIterator currently doesn't support specifying CF.
+	internalKey := kv.InternalKey(kv.CFDefault, key, kv.MaxVersion)
 	iter.iitr.Seek(internalKey)
 	iter.populate()
 }
@@ -285,18 +314,17 @@ func (iter *DBIterator) populateForward() {
 			iter.iitr.Next()
 			continue
 		}
-		if len(iter.lastUserKey) > 0 && bytes.Equal(userKey, iter.lastUserKey) {
-			iter.iitr.Next()
-			continue
-		}
 		if iter.hasLower && bytes.Compare(userKey, iter.lowerBound) < 0 {
-			iter.setLastUserKey(userKey)
 			iter.iitr.Next()
 			continue
 		}
 		if iter.hasUpper && bytes.Compare(userKey, iter.upperBound) >= 0 {
 			iter.valid = false
 			return
+		}
+		if bytes.Equal(userKey, iter.lastUserKey) {
+			iter.iitr.Next()
+			continue
 		}
 
 		ok, err := iter.materializeDecoded(entry, cf, userKey, ts)
@@ -514,7 +542,7 @@ func (iter *DBIterator) materializeDecoded(src *kv.Entry, cf kv.ColumnFamily, us
 		} else {
 			var vp kv.ValuePtr
 			vp.Decode(src.Value)
-			val, cb, err := iter.vlog.read(&vp)
+			val, cb, err := iter.vlog.Read(&vp)
 			if cb != nil {
 				defer cb()
 			}
